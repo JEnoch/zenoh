@@ -23,6 +23,7 @@ members = [
   "plugins/zenoh-storages",
   "backends/traits",
   "backends/influxdb",
+  "backends/file-system",
 ]
 
 exclude = [
