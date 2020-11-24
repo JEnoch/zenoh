@@ -16,23 +16,23 @@
 use async_trait::async_trait;
 use log::{debug, error, warn};
 use std::convert::TryFrom;
-use std::fs::{metadata, remove_file, DirBuilder, File, Metadata};
+use std::fs::DirBuilder;
 use std::io::prelude::*;
+use std::path::Path;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tempfile::tempfile_in;
-use walkdir::WalkDir;
-use zenoh::net::utils::resource_name;
-use zenoh::net::{encoding, DataInfo, RBuf, Sample};
-use zenoh::{
-    Change, ChangeKind, Properties, Selector, Timestamp, TimestampID, Value, ZError, ZErrorKind,
-    ZResult,
-};
+use zenoh::net::{DataInfo, RBuf, Sample};
+use zenoh::{Change, ChangeKind, Properties, Selector, Value, ZError, ZErrorKind, ZResult};
 use zenoh_backend_traits::*;
 use zenoh_util::collections::{Timed, TimedEvent, TimedHandle, Timer};
 use zenoh_util::{zerror, zerror2};
 
+mod files_mgr;
+use files_mgr::*;
+
 // Properies used by the Backend
+//  - None
 
 // Properies used by the Storage
 pub const PROP_STORAGE_READ_ONLY: &str = "read_only";
@@ -87,7 +87,6 @@ impl Backend for FileSystemBackend {
         }
 
         let read_only = props.contains_key(PROP_STORAGE_READ_ONLY);
-        let on_closure = OnClosure::try_from(&props)?;
         let follow_links = match props.get(PROP_STORAGE_FOLLOW_LINK) {
             Some(s) => {
                 if s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no") {
@@ -102,6 +101,19 @@ impl Backend for FileSystemBackend {
                 }
             }
             None => true,
+        };
+
+        let on_closure = match props.get(PROP_STORAGE_ON_CLOSURE) {
+            Some(s) => {
+                if s == "delete_all" {
+                    OnClosure::DeleteAll
+                } else {
+                    return zerror!(ZErrorKind::Other {
+                        descr: format!("Unsupported value for 'on_closure' property: {}", s)
+                    });
+                }
+            }
+            None => OnClosure::DoNothing,
         };
 
         let base_dir = props
@@ -157,15 +169,14 @@ impl Backend for FileSystemBackend {
                 })?;
         }
 
+        let files_mgr = FilesMgr::new(&base_dir, follow_links, on_closure);
+
         let admin_status = zenoh::utils::properties_to_json_value(&props);
         Ok(Box::new(FileSystemStorage {
             admin_status,
-            base_dir,
             path_prefix,
-            dir_builder,
-            follow_links,
+            files_mgr,
             read_only,
-            on_closure,
             timer: Timer::new(),
         }))
     }
@@ -179,37 +190,11 @@ impl Backend for FileSystemBackend {
     }
 }
 
-enum OnClosure {
-    DeleteAll,
-    DoNothing,
-}
-
-impl TryFrom<&Properties> for OnClosure {
-    type Error = ZError;
-    fn try_from(p: &Properties) -> ZResult<OnClosure> {
-        match p.get(PROP_STORAGE_ON_CLOSURE) {
-            Some(s) => {
-                if s == "delete_all" {
-                    Ok(OnClosure::DeleteAll)
-                } else {
-                    zerror!(ZErrorKind::Other {
-                        descr: format!("Unsupported value for 'on_closure' property: {}", s)
-                    })
-                }
-            }
-            None => Ok(OnClosure::DoNothing),
-        }
-    }
-}
-
 struct FileSystemStorage {
     admin_status: Value,
-    base_dir: String,
     path_prefix: String,
-    dir_builder: DirBuilder,
-    follow_links: bool,
+    files_mgr: FilesMgr,
     read_only: bool,
-    on_closure: OnClosure,
     timer: Timer,
 }
 
@@ -225,147 +210,46 @@ impl FileSystemStorage {
     }
 
     async fn reply_with_matching_files(&self, query: &Query, path_expr: &str) {
-        // find the longest segment without '*' to search for files only in the corresponding
-        let star_idx = path_expr.find('*').unwrap();
-        let segment = match path_expr[..star_idx].rfind('/') {
-            Some(i) => &path_expr[..i],
-            None => "",
-        };
-        let dir = concat_str(&self.base_dir, segment);
-        let base_dir_len = self.base_dir.len();
-
-        debug!(
-            "For query on {} search matching files in {}",
-            query.res_name(),
-            dir
-        );
-        let walkdir = WalkDir::new(&dir).follow_links(self.follow_links);
-        // TODO: optimization calling self.reply_with_file() in a task and then join all
-        for entry in walkdir.into_iter() {
-            match entry {
-                Ok(e) => {
-                    if e.file_type().is_file() {
-                        if let Some(p) = e.path().to_str() {
-                            let shortpath = &p[base_dir_len..];
-                            if resource_name::intersect(shortpath, path_expr) {
-                                self.reply_with_file(query, shortpath).await;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Error exploring directory {}: {}", dir, e);
-                }
-            }
+        for path in self.files_mgr.matching_files(path_expr) {
+            self.reply_with_file(query, path).await;
         }
     }
 
-    async fn reply_with_file(&self, query: &Query, shortpath: &str) {
-        // zenoh path for this file is: self.path_prefix + shortpath
-        let zpath = concat_str(&self.path_prefix, shortpath);
+    async fn reply_with_file<P: AsRef<Path>>(&self, query: &Query, relative_path: P) {
+        debug!(
+            "Replying to query on {} with file {}",
+            query.res_name(),
+            relative_path.as_ref().display()
+        );
+        match self.files_mgr.read_file(&relative_path) {
+            Ok((content, encoding, timestamp)) => {
+                // zenoh path for this file is: self.path_prefix + path
+                let zpath = concat_str(&self.path_prefix, relative_path.as_ref().to_str().unwrap());
 
-        // real path for this file is: self.base_dir + shortpath
-        let file = concat_str(&self.base_dir, shortpath);
-
-        match File::open(&file) {
-            Ok(mut f) => {
-                // TODO: what if file is too big ??
-                let size = f.metadata().map(|m| m.len()).unwrap_or(256);
-                if size <= usize::MAX as u64 {
-                    let mut content: Vec<u8> = Vec::with_capacity(size as usize);
-                    if let Err(e) = f.read_to_end(&mut content) {
-                        warn!(
-                            "Replying to query on {} : failed to read file {} : {}",
-                            query.res_name(),
-                            file,
-                            e
-                        );
-                        return;
-                    }
-                    match self.get_data_info(&file) {
-                        Ok(data_info) => {
-                            debug!("Reply file {} for path {}", file, zpath);
-                            query
-                                .reply(Sample {
-                                    res_name: zpath,
-                                    payload: RBuf::from(content),
-                                    data_info: Some(data_info),
-                                })
-                                .await;
-                        }
-                        Err(e) => warn!("{}", e),
-                    }
-                } else {
-                    warn!(
-                        "Replying to query on {} : file {} is too big to fit in memory",
-                        query.res_name(),
-                        file
-                    )
-                }
+                let data_info = DataInfo {
+                    source_id: None,
+                    source_sn: None,
+                    first_router_id: None,
+                    first_router_sn: None,
+                    timestamp: Some(timestamp),
+                    kind: None,
+                    encoding: Some(encoding),
+                };
+                query
+                    .reply(Sample {
+                        res_name: zpath,
+                        payload: RBuf::from(content),
+                        data_info: Some(data_info),
+                    })
+                    .await;
             }
             Err(e) => warn!(
-                "Replying to query on {} : failed to open file {} : {}",
+                "Replying to query on {} : failed to read file {} : {}",
                 query.res_name(),
-                file,
+                relative_path.as_ref().display(),
                 e
             ),
         }
-    }
-
-    fn get_data_info(&self, file: &str) -> ZResult<DataInfo> {
-        // TODO: try to get DataInfo from meta-data file
-
-        // guess mime type from file extension
-        let mime_type = mime_guess::from_path(file).first_or_octet_stream();
-        debug!("Found mime-type {} for {}", mime_type, file);
-        let encoding =
-            encoding::from_str(mime_type.essence_str()).unwrap_or(encoding::APP_OCTET_STREAM);
-
-        // create timestamp from file's modification time
-        let metadata = metadata(file).map_err(|e| {
-            zerror2!(ZErrorKind::Other {
-                descr: format!("Failed to get meta-data for file '{}': {}", file, e)
-            })
-        })?;
-        let sys_time = metadata
-            .modified()
-            .or_else(|_| metadata.accessed())
-            .or_else(|_| metadata.created())
-            .unwrap_or_else(|_| SystemTime::now());
-        let timestamp = Timestamp::new(
-            sys_time.duration_since(UNIX_EPOCH).unwrap().into(),
-            TimestampID::new(1, [0u8; TimestampID::MAX_SIZE]),
-        );
-
-        Ok(DataInfo {
-            source_id: None,
-            source_sn: None,
-            first_router_id: None,
-            first_router_sn: None,
-            timestamp: Some(timestamp),
-            kind: None,
-            encoding: Some(encoding),
-        })
-    }
-
-    fn get_timestamp(&self, file: &str) -> ZResult<Timestamp> {
-        // TODO: try to get Timestamp from meta-data file
-
-        // create timestamp from file's modification time
-        let metadata = metadata(file).map_err(|e| {
-            zerror2!(ZErrorKind::Other {
-                descr: format!("Failed to get meta-data for file '{}': {}", file, e)
-            })
-        })?;
-        let sys_time = metadata
-            .modified()
-            .or_else(|_| metadata.accessed())
-            .or_else(|_| metadata.created())
-            .unwrap_or_else(|_| SystemTime::now());
-        Ok(Timestamp::new(
-            sys_time.duration_since(UNIX_EPOCH).unwrap().into(),
-            TimestampID::new(1, [0u8; TimestampID::MAX_SIZE]),
-        ))
     }
 }
 
@@ -410,7 +294,7 @@ impl Storage for FileSystemStorage {
                 } else {
                     warn!(
                         "Received PUT for read-only Files System Storage on {} - ignored",
-                        self.base_dir
+                        self.files_mgr.base_dir()
                     );
                 }
             }
@@ -428,7 +312,7 @@ impl Storage for FileSystemStorage {
                 } else {
                     warn!(
                         "Received DELETE for read-only Files System Storage on {} - ignored",
-                        self.base_dir
+                        self.files_mgr.base_dir()
                     );
                 }
             }
@@ -457,28 +341,14 @@ impl Storage for FileSystemStorage {
                 self.reply_with_matching_files(&query, path_expr).await;
             } else {
                 // path_expr correspond to 1 single file. Read and send it.
-                self.reply_with_file(&query, path_expr).await;
+                // real path for this file is: base_dir + path_expr
+                let file = concat_str(&self.files_mgr.base_dir(), path_expr);
+
+                self.reply_with_file(&query, file).await;
             }
         }
 
         Ok(())
-    }
-}
-
-impl Drop for FileSystemStorage {
-    fn drop(&mut self) {
-        debug!("Closing InfluxDB storage");
-        match self.on_closure {
-            OnClosure::DeleteAll => {
-                // TODO
-            }
-            OnClosure::DoNothing => {
-                debug!(
-                    "Close File System Storage, keeping directory {} as it is",
-                    self.base_dir
-                );
-            }
-        }
     }
 }
 
@@ -492,11 +362,4 @@ impl Timed for TimedFileCleanup {
     async fn run(&mut self) {
         // TODO
     }
-}
-
-fn concat_str<S1: AsRef<str>, S2: AsRef<str>>(s1: S1, s2: S2) -> String {
-    let mut result = String::with_capacity(s1.as_ref().len() + s2.as_ref().len());
-    result.push_str(s1.as_ref());
-    result.push_str(s2.as_ref());
-    result
 }
