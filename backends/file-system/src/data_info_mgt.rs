@@ -11,16 +11,19 @@
 // Contributors:
 //   ADLINK zenoh team, <zenoh@adlink-labs.tech>
 //
-use async_std::sync::{Arc, RwLock};
-use log::{debug, trace, warn};
-use rocksdb::{Options, DB};
+use rocksdb::DB;
+use std::convert::TryFrom;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use uhlc::NTP64;
 use zenoh::net::ZInt;
-use zenoh::{Timestamp, TimestampID, ZError, ZErrorKind, ZResult};
+use zenoh::{Timestamp, ZError, ZErrorKind, ZResult};
 use zenoh_util::{zerror, zerror2};
 
 const DB_FILENAME: &str = ".zenoh_datainfo";
+
+// size of serialized data-info: encoding (u64) + timestamp (u64 + ID)
+const VAL_LEN: usize = 8 + 8 + uhlc::ID::MAX_SIZE;
 
 pub(crate) struct DataInfoMgr {
     db: DB,
@@ -30,47 +33,91 @@ impl DataInfoMgr {
     pub(crate) fn new(base_dir: &Path) -> ZResult<Self> {
         let mut backup_file = PathBuf::from(base_dir);
         backup_file.push(DB_FILENAME);
-        let backup_file_display = backup_file.display();
 
-        let db = DB::open_default(backup_file).unwrap();
+        let db = DB::open_default(&backup_file).map_err(|e| {
+            zerror2!(ZErrorKind::Other {
+                descr: format!(
+                    "Failed to open data-info database from {:?}: {}",
+                    backup_file, e
+                )
+            })
+        })?;
 
         Ok(DataInfoMgr { db })
     }
 
-    pub(crate) fn get_encoding_and_timestamp(
+    pub(crate) fn put_data_info<P: AsRef<Path>>(
         &self,
-        file: &str,
-    ) -> ZResult<Option<(ZInt, Timestamp)>> {
-        Ok(None)
-    }
-
-    pub(crate) fn get_timestamp(&self, file: &str) -> ZResult<Option<Timestamp>> {
-        Ok(None)
-    }
-
-    /*
-    pub(crate) async fn put_data_info(
-        &self,
-        path: &str,
+        file: P,
         encoding: ZInt,
         timestamp: Timestamp,
     ) -> ZResult<()> {
-        let _ = self
-            .mem_db
-            .write()
-            .await
-            .prepare_cached(INSERT_STMT)
-            .and_then(|mut stmt| {
-                stmt.execute(params![path, false, encoding as i64, timestamp.to_string()])
-            })
+        let key = file.as_ref().to_string_lossy();
+        let mut value: Vec<u8> = Vec::with_capacity(VAL_LEN);
+        value
+            .write_all(&encoding.to_ne_bytes())
+            .and_then(|()| value.write_all(&timestamp.get_time().as_u64().to_ne_bytes()))
+            .and_then(|()| value.write_all(timestamp.get_id().as_slice()))
             .map_err(|e| {
                 zerror2!(ZErrorKind::Other {
-                    descr: format!("Failed to insert data-info for {} in db: {}", path, e)
+                    descr: format!("Failed to encode data-info for {:?}: {}", file.as_ref(), e)
                 })
             })?;
-        Ok(())
+
+        self.db.put(key.as_bytes(), value).map_err(|e| {
+            zerror2!(ZErrorKind::Other {
+                descr: format!("Failed to save data-info for {:?}: {}", file.as_ref(), e)
+            })
+        })
     }
 
+    pub(crate) fn get_encoding_and_timestamp<P: AsRef<Path>>(
+        &self,
+        file: P,
+    ) -> ZResult<Option<(ZInt, Timestamp)>> {
+        let key = file.as_ref().to_string_lossy();
+
+        match self.db.get_pinned(key.as_bytes()) {
+            Ok(Some(pin_val)) => {
+                let mut encoding_bytes = [0u8; 8];
+                encoding_bytes.clone_from_slice(&pin_val.as_ref()[..8]);
+                let encoding = ZInt::from_ne_bytes(encoding_bytes);
+                let mut time_bytes = [0u8; 8];
+                time_bytes.clone_from_slice(&pin_val.as_ref()[8..16]);
+                let time = u64::from_ne_bytes(time_bytes);
+                let id = uhlc::ID::try_from(&pin_val.as_ref()[16..]).unwrap();
+                let timestamp = Timestamp::new(NTP64(time), id);
+
+                Ok(Some((encoding, timestamp)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => zerror!(ZErrorKind::Other {
+                descr: format!("Failed to save data-info for {:?}: {}", file.as_ref(), e)
+            }),
+        }
+    }
+
+    pub(crate) fn get_timestamp<P: AsRef<Path>>(&self, file: P) -> ZResult<Option<Timestamp>> {
+        let key = file.as_ref().to_string_lossy();
+
+        match self.db.get_pinned(key.as_bytes()) {
+            Ok(Some(pin_val)) => {
+                let mut time_bytes = [0u8; 8];
+                time_bytes.clone_from_slice(&pin_val.as_ref()[8..16]);
+                let time = u64::from_ne_bytes(time_bytes);
+                let id = uhlc::ID::try_from(&pin_val.as_ref()[16..]).unwrap();
+                let timestamp = Timestamp::new(NTP64(time), id);
+
+                Ok(Some(timestamp))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => zerror!(ZErrorKind::Other {
+                descr: format!("Failed to save data-info for {:?}: {}", file.as_ref(), e)
+            }),
+        }
+    }
+
+    /*
     pub(crate) fn mark_data_info_deleted(&self, path: &str, timestamp: Timestamp) -> ZResult<()> {
         let _ = self
             .mem_db

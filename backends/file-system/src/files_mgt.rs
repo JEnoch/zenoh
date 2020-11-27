@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::{IntoIter, WalkDir};
 use zenoh::net::utils::resource_name;
-use zenoh::net::{encoding, ZInt};
+use zenoh::net::{encoding, RBuf, ZInt};
 use zenoh::{Timestamp, TimestampID, ZError, ZErrorKind, ZResult};
 use zenoh_util::{zerror, zerror2};
 
@@ -51,7 +51,7 @@ impl FilesMgr {
         dir_builder.recursive(true);
 
         Ok(FilesMgr {
-            base_dir: base_dir,
+            base_dir,
             data_info_mgr,
             follow_links,
             dir_builder,
@@ -61,6 +61,44 @@ impl FilesMgr {
 
     pub(crate) fn base_dir(&self) -> &Path {
         &self.base_dir.as_path()
+    }
+
+    pub(crate) fn write_file<P: AsRef<Path>>(
+        &self,
+        file: P,
+        content: RBuf,
+        encoding: ZInt,
+        timestamp: Timestamp,
+    ) -> ZResult<()> {
+        let mut os_str = self.base_dir().as_os_str().to_os_string();
+        os_str.push(file.as_ref());
+        let path = PathBuf::from(os_str);
+
+        // Create parent directories if needed
+        if let Some(dir) = path.parent() {
+            self.dir_builder.create(dir).map_err(|e| {
+                zerror2!(ZErrorKind::Other {
+                    descr: format!("Failed create directories for file {:?}: {}", path, e)
+                })
+            })?;
+        }
+
+        // Write file
+        let mut f = File::create(&path).map_err(|e| {
+            zerror2!(ZErrorKind::Other {
+                descr: format!("Failed write in file {:?}: {}", path, e)
+            })
+        })?;
+        for slice in content.get_slices() {
+            f.write_all(slice.as_slice()).map_err(|e| {
+                zerror2!(ZErrorKind::Other {
+                    descr: format!("Failed write in file {:?}: {}", path, e)
+                })
+            })?;
+        }
+
+        // save data-info
+        self.data_info_mgr.put_data_info(file, encoding, timestamp)
     }
 
     // Search for files matching path_expr.
@@ -104,8 +142,7 @@ impl FilesMgr {
                             descr: format!(r#"Error reading file {:?}: {}"#, file.as_ref(), e)
                         })
                     } else {
-                        let (timestamp, encoding) =
-                            self.get_encoding_and_timestamp(file.as_ref().to_str().unwrap())?;
+                        let (timestamp, encoding) = self.get_encoding_and_timestamp(file)?;
                         Ok((content, timestamp, encoding))
                     }
                 } else {
@@ -123,14 +160,14 @@ impl FilesMgr {
         }
     }
 
-    fn get_encoding_and_timestamp(&self, file: &str) -> ZResult<(ZInt, Timestamp)> {
+    fn get_encoding_and_timestamp<P: AsRef<Path>>(&self, file: P) -> ZResult<(ZInt, Timestamp)> {
         // TODO: try to get Timestamp and encoding from meta-data file
-        match self.data_info_mgr.get_encoding_and_timestamp(file)? {
+        match self.data_info_mgr.get_encoding_and_timestamp(&file)? {
             Some(x) => Ok(x),
             None => {
                 // fallback: guess mime type from file extension
-                let mime_type = mime_guess::from_path(file).first_or_octet_stream();
-                debug!("Found mime-type {} for {}", mime_type, file);
+                let mime_type = mime_guess::from_path(&file).first_or_octet_stream();
+                debug!("Found mime-type {} for {:?}", mime_type, file.as_ref());
                 let encoding = encoding::from_str(mime_type.essence_str())
                     .unwrap_or(encoding::APP_OCTET_STREAM);
 
@@ -142,13 +179,13 @@ impl FilesMgr {
         }
     }
 
-    pub(crate) fn get_timestamp(&self, file: &str) -> ZResult<Option<Timestamp>> {
+    pub(crate) fn get_timestamp<P: AsRef<Path>>(&self, file: P) -> ZResult<Option<Timestamp>> {
         // try to get Timestamp from data_info_mgr
-        match self.data_info_mgr.get_timestamp(file)? {
+        match self.data_info_mgr.get_timestamp(&file)? {
             Some(x) => Ok(Some(x)),
             None => {
                 // fallback: get timestamp from file's metadata if it exists
-                if Path::new(file).exists() {
+                if file.as_ref().exists() {
                     let timestamp = self.get_timestamp_from_metadata(file)?;
                     Ok(Some(timestamp))
                 } else {
@@ -158,10 +195,14 @@ impl FilesMgr {
         }
     }
 
-    fn get_timestamp_from_metadata(&self, file: &str) -> ZResult<Timestamp> {
-        let metadata = metadata(file).map_err(|e| {
+    fn get_timestamp_from_metadata<P: AsRef<Path>>(&self, file: P) -> ZResult<Timestamp> {
+        let metadata = metadata(&file).map_err(|e| {
             zerror2!(ZErrorKind::Other {
-                descr: format!("Failed to get meta-data for file '{}': {}", file, e)
+                descr: format!(
+                    "Failed to get meta-data for file {:?}: {}",
+                    file.as_ref(),
+                    e
+                )
             })
         })?;
         let sys_time = metadata
