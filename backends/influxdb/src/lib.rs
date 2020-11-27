@@ -370,6 +370,12 @@ impl Storage for InfluxDbStorage {
                     }
                 }
 
+                // check that there is a value for this PUT sample
+                if change.value.is_none() {
+                    return zerror!(ZErrorKind::Other {
+                        descr: format!("Received a PUT Sample without value for {}", change.path)
+                    });
+                }
                 // encode the value as a string to be stored in InfluxDB
                 let (encoding, base64, value) = change.value.unwrap().encode_to_string();
 

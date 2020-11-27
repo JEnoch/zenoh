@@ -120,7 +120,7 @@ impl Backend for FileSystemBackend {
 
         let base_dir = props
             .get(PROP_STORAGE_DIR)
-            .map(|s| PathBuf::from(s))
+            .map(PathBuf::from)
             .ok_or_else(|| {
                 zerror2!(ZErrorKind::Other {
                     descr: format!(
@@ -128,8 +128,7 @@ impl Backend for FileSystemBackend {
                         PROP_STORAGE_DIR
                     )
                 })
-            })?
-            .clone();
+            })?;
 
         // check if base_dir exists and is readable (and writeable if not "read_only" mode)
         let mut dir_builder = DirBuilder::new();
@@ -266,14 +265,15 @@ impl Storage for FileSystemStorage {
 
     // When receiving a Sample (i.e. on PUT or DELETE operations)
     async fn on_sample(&mut self, sample: Sample) -> ZResult<()> {
-        // transform the Sample into a Change to get kind, encoding and timestamp
+        // transform the Sample into a Change to get kind, encoding and timestamp (not decoding => RawValue)
         let change = Change::from_sample(sample, false)?;
 
-        // file path (relative to base_dir) is the zenoh path stripped of "path_prefix"
+        // file path is the zenoh path stripped from "path_prefix" and converted to a files system Path
         let file_path = change
             .path
             .as_str()
             .strip_prefix(&self.path_prefix)
+            .map(zpath_to_fspath)
             .ok_or_else(|| {
                 zerror2!(ZErrorKind::Other {
                     descr: format!(
@@ -282,18 +282,36 @@ impl Storage for FileSystemStorage {
                     )
                 })
             })?;
+        let file = Path::new(file_path.as_ref());
 
         // Store or delete the sample depending the ChangeKind
         match change.kind {
             ChangeKind::PUT => {
                 if !self.read_only {
-                    // TODO
-                    error!("UNIMPL");
+                    // get latest timestamp for this file (if exists) and drop incoming sample if older
+                    if let Some(old_ts) = self.files_mgr.get_timestamp(file)? {
+                        if change.timestamp < old_ts {
+                            debug!("PUT on {} dropped: out-of-date", change.path);
+                            return Ok(());
+                        }
+                    }
 
-                    // get latest timestamp for this file, it exists
-                    // self.files_mgr.get_timestamp(file_path)
+                    // check that there is a value for this PUT sample
+                    if change.value.is_none() {
+                        return zerror!(ZErrorKind::Other {
+                            descr: format!(
+                                "Received a PUT Sample without value for {}",
+                                change.path
+                            )
+                        });
+                    }
 
-                    // encode the value as a string to be stored in InfluxDB
+                    // get the encoding and buffer from the value (RawValue => direct access to inner RBuf)
+                    let (encoding, buf) = change.value.unwrap().encode();
+
+                    // write file
+                    self.files_mgr
+                        .write_file(file, buf, encoding, change.timestamp)
 
                     // Note: tags are stored as strings in InfluxDB, while fileds are typed.
                     // For simpler/faster deserialization, we store encoding, timestamp and base64 as fields.
@@ -303,6 +321,7 @@ impl Storage for FileSystemStorage {
                         "Received PUT for read-only Files System Storage on {:?} - ignored",
                         self.files_mgr.base_dir()
                     );
+                    Ok(())
                 }
             }
             ChangeKind::DELETE => {
@@ -316,18 +335,21 @@ impl Storage for FileSystemStorage {
                     // store a point (with timestamp) with "delete" tag, thus we don't re-introduce an older point later
 
                     // schedule the drop of measurement later in the future, if it's empty
+
+                    Ok(())
                 } else {
                     warn!(
                         "Received DELETE for read-only Files System Storage on {:?} - ignored",
                         self.files_mgr.base_dir()
                     );
+                    Ok(())
                 }
             }
             ChangeKind::PATCH => {
                 println!("Received PATCH for {}: not yet supported", change.path);
+                Ok(())
             }
         }
-        Ok(())
     }
 
     // When receiving a Query (i.e. on GET operations)
@@ -349,7 +371,6 @@ impl Storage for FileSystemStorage {
             } else {
                 // path_expr correspond to 1 single file. Read and send it.
                 // real path for this file is: base_dir + path_expr
-                // let file = PathBuf::from(zpath_to_fspath(path_expr).as_ref());
                 let fspath = zpath_to_fspath(path_expr);
                 let file = concat_paths(&self.files_mgr.base_dir(), fspath);
                 self.reply_with_file(&query, file).await;
