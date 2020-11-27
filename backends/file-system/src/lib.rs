@@ -15,6 +15,7 @@
 
 use async_trait::async_trait;
 use log::{debug, error, warn};
+use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fs::DirBuilder;
 use std::io::prelude::*;
@@ -28,8 +29,9 @@ use zenoh_backend_traits::*;
 use zenoh_util::collections::{Timed, TimedEvent, TimedHandle, Timer};
 use zenoh_util::{zerror, zerror2};
 
-mod files_mgr;
-use files_mgr::*;
+mod data_info_mgt;
+mod files_mgt;
+use files_mgt::*;
 
 // Properies used by the Backend
 //  - None
@@ -118,6 +120,7 @@ impl Backend for FileSystemBackend {
 
         let base_dir = props
             .get(PROP_STORAGE_DIR)
+            .map(|s| PathBuf::from(s))
             .ok_or_else(|| {
                 zerror2!(ZErrorKind::Other {
                     descr: format!(
@@ -136,7 +139,7 @@ impl Backend for FileSystemBackend {
             if let Err(err) = dir_builder.create(&base_dir) {
                 return zerror!(ZErrorKind::Other {
                     descr: format!(
-                        r#"Cannot create File System Storage on "dir"={} : {}"#,
+                        r#"Cannot create File System Storage on "dir"={:?} : {}"#,
                         base_dir, err
                     )
                 });
@@ -144,14 +147,14 @@ impl Backend for FileSystemBackend {
         } else if !base_dir_path.is_dir() {
             return zerror!(ZErrorKind::Other {
                 descr: format!(
-                    r#"Cannot create File System Storage on "dir"={} : this is not a directory"#,
+                    r#"Cannot create File System Storage on "dir"={:?} : this is not a directory"#,
                     base_dir
                 )
             });
         } else if let Err(err) = base_dir_path.read_dir() {
             return zerror!(ZErrorKind::Other {
                 descr: format!(
-                    r#"Cannot create File System Storage on "dir"={} : {}"#,
+                    r#"Cannot create File System Storage on "dir"={:?} : {}"#,
                     base_dir, err
                 )
             });
@@ -162,14 +165,14 @@ impl Backend for FileSystemBackend {
                 .map_err(|err| {
                     zerror2!(ZErrorKind::Other {
                         descr: format!(
-                            r#"Cannot create writeable File System Storage on "dir"={} : {}"#,
+                            r#"Cannot create writeable File System Storage on "dir"={:?} : {}"#,
                             base_dir, err
                         )
                     })
                 })?;
         }
 
-        let files_mgr = FilesMgr::new(&base_dir, follow_links, on_closure);
+        let files_mgr = FilesMgr::new(base_dir, follow_links, on_closure)?;
 
         let admin_status = zenoh::utils::properties_to_json_value(&props);
         Ok(Box::new(FileSystemStorage {
@@ -215,16 +218,18 @@ impl FileSystemStorage {
         }
     }
 
-    async fn reply_with_file<P: AsRef<Path>>(&self, query: &Query, relative_path: P) {
+    async fn reply_with_file<P: AsRef<Path>>(&self, query: &Query, file: P) {
         debug!(
-            "Replying to query on {} with file {}",
+            "Replying to query on {} with file {:?}",
             query.res_name(),
-            relative_path.as_ref().display()
+            file.as_ref()
         );
-        match self.files_mgr.read_file(&relative_path) {
+        match self.files_mgr.read_file(&file) {
             Ok((content, encoding, timestamp)) => {
-                // zenoh path for this file is: self.path_prefix + path
-                let zpath = concat_str(&self.path_prefix, relative_path.as_ref().to_str().unwrap());
+                // zenoh path for this file: convert to zpath and replace the base_dir prefix by path_prefix
+                let relative_zpath =
+                    &fspath_to_zpath(file.as_ref())[self.files_mgr.base_dir().as_os_str().len()..];
+                let zpath = concat_str(&self.path_prefix, relative_zpath);
 
                 let data_info = DataInfo {
                     source_id: None,
@@ -244,9 +249,9 @@ impl FileSystemStorage {
                     .await;
             }
             Err(e) => warn!(
-                "Replying to query on {} : failed to read file {} : {}",
+                "Replying to query on {} : failed to read file {:?} : {}",
                 query.res_name(),
-                relative_path.as_ref().display(),
+                file.as_ref(),
                 e
             ),
         }
@@ -261,6 +266,7 @@ impl Storage for FileSystemStorage {
 
     // When receiving a Sample (i.e. on PUT or DELETE operations)
     async fn on_sample(&mut self, sample: Sample) -> ZResult<()> {
+        // transform the Sample into a Change to get kind, encoding and timestamp
         let change = Change::from_sample(sample, false)?;
 
         // file path (relative to base_dir) is the zenoh path stripped of "path_prefix"
@@ -284,7 +290,8 @@ impl Storage for FileSystemStorage {
                     // TODO
                     error!("UNIMPL");
 
-                    // get timestamp of deletion of this measurement, if any
+                    // get latest timestamp for this file, it exists
+                    // self.files_mgr.get_timestamp(file_path)
 
                     // encode the value as a string to be stored in InfluxDB
 
@@ -293,7 +300,7 @@ impl Storage for FileSystemStorage {
                     // while the kind is stored as a tag to be indexed by InfluxDB and have faster queries on it.
                 } else {
                     warn!(
-                        "Received PUT for read-only Files System Storage on {} - ignored",
+                        "Received PUT for read-only Files System Storage on {:?} - ignored",
                         self.files_mgr.base_dir()
                     );
                 }
@@ -311,7 +318,7 @@ impl Storage for FileSystemStorage {
                     // schedule the drop of measurement later in the future, if it's empty
                 } else {
                     warn!(
-                        "Received DELETE for read-only Files System Storage on {} - ignored",
+                        "Received DELETE for read-only Files System Storage on {:?} - ignored",
                         self.files_mgr.base_dir()
                     );
                 }
@@ -342,8 +349,9 @@ impl Storage for FileSystemStorage {
             } else {
                 // path_expr correspond to 1 single file. Read and send it.
                 // real path for this file is: base_dir + path_expr
-                let file = concat_str(&self.files_mgr.base_dir(), path_expr);
-
+                // let file = PathBuf::from(zpath_to_fspath(path_expr).as_ref());
+                let fspath = zpath_to_fspath(path_expr);
+                let file = concat_paths(&self.files_mgr.base_dir(), fspath);
                 self.reply_with_file(&query, file).await;
             }
         }
@@ -362,4 +370,35 @@ impl Timed for TimedFileCleanup {
     async fn run(&mut self) {
         // TODO
     }
+}
+
+#[cfg(unix)]
+#[inline(always)]
+pub(crate) fn zpath_to_fspath(zpath: &str) -> Cow<'_, str> {
+    Cow::from(zpath)
+}
+
+#[cfg(windows)]
+pub(crate) fn zpath_to_fspath(zpath: &str) -> Cow<'_, str> {
+    const WIN_SEP: &str = r#"\"#;
+    Cow::from(zpath.replace('/', WIN_SEP))
+}
+
+#[cfg(unix)]
+#[inline(always)]
+pub(crate) fn fspath_to_zpath(fspath: &Path) -> Cow<'_, str> {
+    fspath.to_string_lossy()
+}
+
+#[cfg(windows)]
+pub(crate) fn fspath_to_zpath(fspath: &Path) -> Cow<'_, str> {
+    const ZENOH_SEP: &str = "/";
+    let cow = fspath.to_string_lossy();
+    Cow::from(cow.replace(std::path::MAIN_SEPARATOR, ZENOH_SEP))
+}
+
+pub(crate) fn concat_paths<P1: AsRef<Path>, P2: AsRef<str>>(p1: P1, p2: P2) -> PathBuf {
+    let mut os_str = p1.as_ref().as_os_str().to_os_string();
+    os_str.push(p2.as_ref());
+    PathBuf::from(os_str)
 }
