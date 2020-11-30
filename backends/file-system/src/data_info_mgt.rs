@@ -11,6 +11,7 @@
 // Contributors:
 //   ADLINK zenoh team, <zenoh@adlink-labs.tech>
 //
+use log::trace;
 use rocksdb::DB;
 use std::convert::TryFrom;
 use std::io::Write;
@@ -53,6 +54,7 @@ impl DataInfoMgr {
         timestamp: Timestamp,
     ) -> ZResult<()> {
         let key = file.as_ref().to_string_lossy();
+        trace!("Put data-info for {}", key);
         let mut value: Vec<u8> = Vec::with_capacity(VAL_LEN);
         value
             .write_all(&encoding.to_ne_bytes())
@@ -76,7 +78,7 @@ impl DataInfoMgr {
         file: P,
     ) -> ZResult<Option<(ZInt, Timestamp)>> {
         let key = file.as_ref().to_string_lossy();
-
+        trace!("Get data-info for {}", key);
         match self.db.get_pinned(key.as_bytes()) {
             Ok(Some(pin_val)) => {
                 let mut encoding_bytes = [0u8; 8];
@@ -90,7 +92,10 @@ impl DataInfoMgr {
 
                 Ok(Some((encoding, timestamp)))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                trace!("data-info for {:?} not found", file.as_ref());
+                Ok(None)
+            }
             Err(e) => zerror!(ZErrorKind::Other {
                 descr: format!("Failed to save data-info for {:?}: {}", file.as_ref(), e)
             }),
@@ -99,7 +104,7 @@ impl DataInfoMgr {
 
     pub(crate) fn get_timestamp<P: AsRef<Path>>(&self, file: P) -> ZResult<Option<Timestamp>> {
         let key = file.as_ref().to_string_lossy();
-
+        trace!("Get timestamp for {}", key);
         match self.db.get_pinned(key.as_bytes()) {
             Ok(Some(pin_val)) => {
                 let mut time_bytes = [0u8; 8];
@@ -110,7 +115,10 @@ impl DataInfoMgr {
 
                 Ok(Some(timestamp))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                trace!("timestamp for {:?} not found", file.as_ref());
+                Ok(None)
+            }
             Err(e) => zerror!(ZErrorKind::Other {
                 descr: format!("Failed to save data-info for {:?}: {}", file.as_ref(), e)
             }),
@@ -145,24 +153,5 @@ impl DataInfoMgr {
                 })
             })?;
         Ok(())
-    }
-
-    pub(crate) fn get_timestamp(&self, path: &str) -> ZResult<Option<Timestamp>> {
-        self.mem_db
-            .prepare_cached(SELECT_TS_STMT)
-            .and_then(|mut stmt| {
-                stmt.query_row(params![path], |row| {
-                    row.get::<usize, TsWrapper>(0).map(|w| w.ts)
-                })
-                .optional()
-            })
-            .map_err(|e| {
-                zerror2!(ZErrorKind::Other {
-                    descr: format!(
-                        "Failed to get timestamp for data-info for {} in db: {}",
-                        path, e
-                    )
-                })
-            })
     }*/
 }

@@ -12,7 +12,9 @@
 //   ADLINK zenoh team, <zenoh@adlink-labs.tech>
 //
 
-use log::{debug, warn};
+use log::{debug, trace, warn};
+use std::borrow::Cow;
+use std::fmt;
 use std::fs::{metadata, DirBuilder, File};
 use std::io::prelude::*;
 use std::iter::Iterator;
@@ -29,6 +31,18 @@ use crate::data_info_mgt::*;
 pub(crate) enum OnClosure {
     DeleteAll,
     DoNothing,
+}
+
+// a structure holding a zenoh path (absolute) and the corresponding file-system path (including the base_dir)
+pub(crate) struct ZFile<'a> {
+    pub(crate) zpath: Cow<'a, str>,
+    fspath: PathBuf,
+}
+
+impl fmt::Display for ZFile<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self.fspath)
+    }
 }
 
 pub(crate) struct FilesMgr {
@@ -63,36 +77,48 @@ impl FilesMgr {
         &self.base_dir.as_path()
     }
 
-    pub(crate) fn write_file<P: AsRef<Path>>(
+    pub(crate) fn to_zfile<'a>(&self, zpath: &'a str) -> ZFile<'a> {
+        ZFile {
+            zpath: Cow::from(zpath),
+            fspath: self.to_fspath(zpath),
+        }
+    }
+
+    fn to_fspath(&self, zpath: &str) -> PathBuf {
+        let mut os_str = self.base_dir().as_os_str().to_os_string();
+        os_str.push(zpath_to_fspath(zpath).as_ref());
+        PathBuf::from(os_str)
+    }
+
+    pub(crate) fn write_file(
         &self,
-        file: P,
+        zfile: &ZFile<'_>,
         content: RBuf,
         encoding: ZInt,
         timestamp: Timestamp,
     ) -> ZResult<()> {
-        let mut os_str = self.base_dir().as_os_str().to_os_string();
-        os_str.push(file.as_ref());
-        let path = PathBuf::from(os_str);
+        let file = &zfile.fspath;
 
         // Create parent directories if needed
-        if let Some(dir) = path.parent() {
+        if let Some(dir) = file.parent() {
             self.dir_builder.create(dir).map_err(|e| {
                 zerror2!(ZErrorKind::Other {
-                    descr: format!("Failed create directories for file {:?}: {}", path, e)
+                    descr: format!("Failed create directories for file {:?}: {}", file, e)
                 })
             })?;
         }
 
         // Write file
-        let mut f = File::create(&path).map_err(|e| {
+        trace!("Write in file {:?}", file);
+        let mut f = File::create(&file).map_err(|e| {
             zerror2!(ZErrorKind::Other {
-                descr: format!("Failed write in file {:?}: {}", path, e)
+                descr: format!("Failed write in file {:?}: {}", file, e)
             })
         })?;
         for slice in content.get_slices() {
             f.write_all(slice.as_slice()).map_err(|e| {
                 zerror2!(ZErrorKind::Other {
-                    descr: format!("Failed write in file {:?}: {}", path, e)
+                    descr: format!("Failed write in file {:?}: {}", file, e)
                 })
             })?;
         }
@@ -102,26 +128,25 @@ impl FilesMgr {
     }
 
     // Search for files matching path_expr.
-    // WARNING: the returend paths will include the "base_dir" prefix (because of Walkdir behaviour)
-    pub(crate) fn matching_files<'a>(&self, path_expr: &'a str) -> FilesIterator<'a> {
+    pub(crate) fn matching_files<'a>(&self, zpath_expr: &'a str) -> FilesIterator<'a> {
         // find the longest segment without '*' to search for files only in the corresponding
-        let star_idx = path_expr.find('*').unwrap();
-        let segment = match path_expr[..star_idx].rfind('/') {
-            Some(i) => &path_expr[..i],
+        let star_idx = zpath_expr.find('*').unwrap();
+        let segment = match zpath_expr[..star_idx].rfind('/') {
+            Some(i) => &zpath_expr[..i],
             None => "",
         };
-        let mut search_dir = self.base_dir.as_os_str().to_os_string();
-        search_dir.push(segment);
+        // Directory to search for matching files is base_dir + segment converted as a file-system path
+        let search_dir = self.to_fspath(segment);
         let base_dir_len = self.base_dir.as_os_str().len();
 
         debug!(
             "For path_expr={} search matching files in {:?}",
-            path_expr, search_dir
+            zpath_expr, search_dir
         );
         let walkdir = WalkDir::new(search_dir).follow_links(self.follow_links);
         FilesIterator {
             walk_iter: walkdir.into_iter(),
-            path_expr,
+            zpath_expr,
             base_dir_len,
         }
     }
@@ -129,45 +154,48 @@ impl FilesMgr {
     // Read a file and return it's content (as Vec<u8>), encoding and timestamp.
     // Encoding and timestamp are retrieved from the data_info_mgr if file was put via zenoh.
     // Otherwise, the encoding is guessed from the file extension, and the timestamp is computed from the file's time.
-    // WARNING: 'file' is expected to include the "base_dir" prefix (to be callable with results of matching_files())
-    pub(crate) fn read_file<P: AsRef<Path>>(&self, file: P) -> ZResult<(Vec<u8>, ZInt, Timestamp)> {
+    pub(crate) fn read_file(&self, zfile: &ZFile<'_>) -> ZResult<(Vec<u8>, ZInt, Timestamp)> {
+        let file = &zfile.fspath;
         match File::open(&file) {
             Ok(mut f) => {
                 // TODO: what if file is too big ??
                 let size = f.metadata().map(|m| m.len()).unwrap_or(256);
                 if size <= usize::MAX as u64 {
+                    trace!("Read file {:?}", file);
                     let mut content: Vec<u8> = Vec::with_capacity(size as usize);
                     if let Err(e) = f.read_to_end(&mut content) {
                         zerror!(ZErrorKind::Other {
-                            descr: format!(r#"Error reading file {:?}: {}"#, file.as_ref(), e)
+                            descr: format!(r#"Error reading file {:?}: {}"#, file, e)
                         })
                     } else {
-                        let (timestamp, encoding) = self.get_encoding_and_timestamp(file)?;
+                        let (timestamp, encoding) = self.get_encoding_and_timestamp(zfile)?;
                         Ok((content, timestamp, encoding))
                     }
                 } else {
                     zerror!(ZErrorKind::Other {
                         descr: format!(
                             r#"Error reading file {:?}: too big to fit in memory"#,
-                            file.as_ref()
+                            file
                         )
                     })
                 }
             }
             Err(e) => zerror!(ZErrorKind::Other {
-                descr: format!(r#"Error reading file {:?}: {}"#, file.as_ref(), e)
+                descr: format!(r#"Error reading file {:?}: {}"#, file, e)
             }),
         }
     }
 
-    fn get_encoding_and_timestamp<P: AsRef<Path>>(&self, file: P) -> ZResult<(ZInt, Timestamp)> {
-        // TODO: try to get Timestamp and encoding from meta-data file
-        match self.data_info_mgr.get_encoding_and_timestamp(&file)? {
+    fn get_encoding_and_timestamp(&self, zfile: &ZFile<'_>) -> ZResult<(ZInt, Timestamp)> {
+        let file = &zfile.fspath;
+        // try to get Encoding and Timestamp from data_info_mgr
+        match self.data_info_mgr.get_encoding_and_timestamp(file)? {
             Some(x) => Ok(x),
             None => {
+                trace!("data-info for {:?} not found; fallback to metadata", file);
                 // fallback: guess mime type from file extension
                 let mime_type = mime_guess::from_path(&file).first_or_octet_stream();
-                debug!("Found mime-type {} for {:?}", mime_type, file.as_ref());
+                trace!("Found mime-type {} for {:?}", mime_type, file);
                 let encoding = encoding::from_str(mime_type.essence_str())
                     .unwrap_or(encoding::APP_OCTET_STREAM);
 
@@ -179,13 +207,14 @@ impl FilesMgr {
         }
     }
 
-    pub(crate) fn get_timestamp<P: AsRef<Path>>(&self, file: P) -> ZResult<Option<Timestamp>> {
+    pub(crate) fn get_timestamp(&self, zfile: &ZFile<'_>) -> ZResult<Option<Timestamp>> {
+        let file = &zfile.fspath;
         // try to get Timestamp from data_info_mgr
         match self.data_info_mgr.get_timestamp(&file)? {
             Some(x) => Ok(Some(x)),
             None => {
                 // fallback: get timestamp from file's metadata if it exists
-                if file.as_ref().exists() {
+                if file.exists() {
                     let timestamp = self.get_timestamp_from_metadata(file)?;
                     Ok(Some(timestamp))
                 } else {
@@ -236,38 +265,69 @@ impl Drop for FilesMgr {
 
 pub(crate) struct FilesIterator<'a> {
     walk_iter: IntoIter,
-    path_expr: &'a str,
+    zpath_expr: &'a str,
     base_dir_len: usize,
 }
 
-impl Iterator for FilesIterator<'_> {
-    type Item = PathBuf;
+impl<'a> Iterator for FilesIterator<'a> {
+    type Item = ZFile<'a>;
     fn next(&mut self) -> Option<Self::Item> {
+        let zpath_expr = self.zpath_expr;
         let base_dir_len = self.base_dir_len;
-        let path_expr = self.path_expr;
         self.walk_iter.find_map(|result| match result {
             Ok(e) => {
                 if e.file_type().is_file() {
-                    if let Some(p) = e.path().to_str() {
-                        let shortpath = &p[base_dir_len..];
-                        if resource_name::intersect(shortpath, path_expr) {
-                            return Some(e.into_path());
+                    let fspath = e.into_path();
+                    if let Some(s) = fspath.to_str() {
+                        // zpath is the file's absolute path stripped from base_dir and converted as zenoh path
+                        // note: force owning to not have fspath borrowed
+                        let zpath = Cow::from(fspath_to_zpath(&s[base_dir_len..]).into_owned());
+                        // convert it to zenoh path for matching test with zpath_expr
+                        if resource_name::intersect(zpath.as_ref(), zpath_expr) {
+                            // matching file; return a ZFile
+                            let zfile = ZFile {
+                                zpath: zpath,
+                                fspath: fspath.clone(),
+                            };
+                            return Some(zfile);
                         }
-                    }
+                    } else {
+                        debug!(
+                            "Looking for files matching {}: ignore {:?} as non UTF-8 filename",
+                            zpath_expr, fspath
+                        );
+                    };
                 }
                 None
             }
             Err(e) => {
-                warn!("Error looking for file matching {} : {}", path_expr, e);
+                warn!("Error looking for files matching {} : {}", zpath_expr, e);
                 None
             }
         })
     }
 }
 
-pub(crate) fn concat_str<S1: AsRef<str>, S2: AsRef<str>>(s1: S1, s2: S2) -> String {
-    let mut result = String::with_capacity(s1.as_ref().len() + s2.as_ref().len());
-    result.push_str(s1.as_ref());
-    result.push_str(s2.as_ref());
-    result
+#[cfg(unix)]
+#[inline(always)]
+pub(crate) fn zpath_to_fspath(zpath: &str) -> Cow<'_, str> {
+    Cow::from(zpath)
+}
+
+#[cfg(windows)]
+pub(crate) fn zpath_to_fspath(zpath: &str) -> Cow<'_, str> {
+    const WIN_SEP: &str = r#"\"#;
+    Cow::from(zpath.replace('/', WIN_SEP))
+}
+
+#[cfg(unix)]
+#[inline(always)]
+pub(crate) fn fspath_to_zpath(fspath: &str) -> Cow<'_, str> {
+    Cow::from(fspath)
+}
+
+#[cfg(windows)]
+pub(crate) fn fspath_to_zpath(fspath: &str) -> Cow<'_, str> {
+    const ZENOH_SEP: &str = "/";
+    Cow::from(fspath.replace(std::path::MAIN_SEPARATOR, ZENOH_SEP))
 }

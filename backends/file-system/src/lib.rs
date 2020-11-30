@@ -15,11 +15,9 @@
 
 use async_trait::async_trait;
 use log::{debug, error, warn};
-use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fs::DirBuilder;
 use std::io::prelude::*;
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tempfile::tempfile_in;
@@ -212,23 +210,21 @@ impl FileSystemStorage {
     }
 
     async fn reply_with_matching_files(&self, query: &Query, path_expr: &str) {
-        for path in self.files_mgr.matching_files(path_expr) {
-            self.reply_with_file(query, path).await;
+        for zfile in self.files_mgr.matching_files(path_expr) {
+            self.reply_with_file(query, &zfile).await;
         }
     }
 
-    async fn reply_with_file<P: AsRef<Path>>(&self, query: &Query, file: P) {
+    async fn reply_with_file(&self, query: &Query, zfile: &ZFile<'_>) {
         debug!(
-            "Replying to query on {} with file {:?}",
+            "Replying to query on {} with file {}",
             query.res_name(),
-            file.as_ref()
+            zfile
         );
-        match self.files_mgr.read_file(&file) {
+        match self.files_mgr.read_file(&zfile) {
             Ok((content, encoding, timestamp)) => {
-                // zenoh path for this file: convert to zpath and replace the base_dir prefix by path_prefix
-                let relative_zpath =
-                    &fspath_to_zpath(file.as_ref())[self.files_mgr.base_dir().as_os_str().len()..];
-                let zpath = concat_str(&self.path_prefix, relative_zpath);
+                // append path_prefix to the zenoh path of this ZFile
+                let zpath = concat_str(&self.path_prefix, zfile.zpath.as_ref());
 
                 let data_info = DataInfo {
                     source_id: None,
@@ -248,9 +244,9 @@ impl FileSystemStorage {
                     .await;
             }
             Err(e) => warn!(
-                "Replying to query on {} : failed to read file {:?} : {}",
+                "Replying to query on {} : failed to read file {} : {}",
                 query.res_name(),
-                file.as_ref(),
+                zfile,
                 e
             ),
         }
@@ -268,12 +264,12 @@ impl Storage for FileSystemStorage {
         // transform the Sample into a Change to get kind, encoding and timestamp (not decoding => RawValue)
         let change = Change::from_sample(sample, false)?;
 
-        // file path is the zenoh path stripped from "path_prefix" and converted to a files system Path
-        let file_path = change
+        // strip path from "path_prefix" and converted to a ZFile
+        let zfile = change
             .path
             .as_str()
             .strip_prefix(&self.path_prefix)
-            .map(zpath_to_fspath)
+            .map(|p| self.files_mgr.to_zfile(p))
             .ok_or_else(|| {
                 zerror2!(ZErrorKind::Other {
                     descr: format!(
@@ -282,20 +278,20 @@ impl Storage for FileSystemStorage {
                     )
                 })
             })?;
-        let file = Path::new(file_path.as_ref());
+
+        // get latest timestamp for this file (if referenced in data-info db or if exists on disk)
+        // and drop incoming sample if older
+        if let Some(old_ts) = self.files_mgr.get_timestamp(&zfile)? {
+            if change.timestamp < old_ts {
+                debug!("{} on {} dropped: out-of-date", change.kind, change.path);
+                return Ok(());
+            }
+        }
 
         // Store or delete the sample depending the ChangeKind
         match change.kind {
             ChangeKind::PUT => {
                 if !self.read_only {
-                    // get latest timestamp for this file (if exists) and drop incoming sample if older
-                    if let Some(old_ts) = self.files_mgr.get_timestamp(file)? {
-                        if change.timestamp < old_ts {
-                            debug!("PUT on {} dropped: out-of-date", change.path);
-                            return Ok(());
-                        }
-                    }
-
                     // check that there is a value for this PUT sample
                     if change.value.is_none() {
                         return zerror!(ZErrorKind::Other {
@@ -311,7 +307,7 @@ impl Storage for FileSystemStorage {
 
                     // write file
                     self.files_mgr
-                        .write_file(file, buf, encoding, change.timestamp)
+                        .write_file(&zfile, buf, encoding, change.timestamp)
 
                     // Note: tags are stored as strings in InfluxDB, while fileds are typed.
                     // For simpler/faster deserialization, we store encoding, timestamp and base64 as fields.
@@ -369,11 +365,10 @@ impl Storage for FileSystemStorage {
             if path_expr.contains('*') {
                 self.reply_with_matching_files(&query, path_expr).await;
             } else {
-                // path_expr correspond to 1 single file. Read and send it.
-                // real path for this file is: base_dir + path_expr
-                let fspath = zpath_to_fspath(path_expr);
-                let file = concat_paths(&self.files_mgr.base_dir(), fspath);
-                self.reply_with_file(&query, file).await;
+                // path_expr correspond to 1 single file.
+                // Convert it to ZFile and reply it.
+                let zfile = self.files_mgr.to_zfile(path_expr);
+                self.reply_with_file(&query, &zfile).await;
             }
         }
 
@@ -393,33 +388,9 @@ impl Timed for TimedFileCleanup {
     }
 }
 
-#[cfg(unix)]
-#[inline(always)]
-pub(crate) fn zpath_to_fspath(zpath: &str) -> Cow<'_, str> {
-    Cow::from(zpath)
-}
-
-#[cfg(windows)]
-pub(crate) fn zpath_to_fspath(zpath: &str) -> Cow<'_, str> {
-    const WIN_SEP: &str = r#"\"#;
-    Cow::from(zpath.replace('/', WIN_SEP))
-}
-
-#[cfg(unix)]
-#[inline(always)]
-pub(crate) fn fspath_to_zpath(fspath: &Path) -> Cow<'_, str> {
-    fspath.to_string_lossy()
-}
-
-#[cfg(windows)]
-pub(crate) fn fspath_to_zpath(fspath: &Path) -> Cow<'_, str> {
-    const ZENOH_SEP: &str = "/";
-    let cow = fspath.to_string_lossy();
-    Cow::from(cow.replace(std::path::MAIN_SEPARATOR, ZENOH_SEP))
-}
-
-pub(crate) fn concat_paths<P1: AsRef<Path>, P2: AsRef<str>>(p1: P1, p2: P2) -> PathBuf {
-    let mut os_str = p1.as_ref().as_os_str().to_os_string();
-    os_str.push(p2.as_ref());
-    PathBuf::from(os_str)
+pub(crate) fn concat_str<S1: AsRef<str>, S2: AsRef<str>>(s1: S1, s2: S2) -> String {
+    let mut result = String::with_capacity(s1.as_ref().len() + s2.as_ref().len());
+    result.push_str(s1.as_ref());
+    result.push_str(s2.as_ref());
+    result
 }
