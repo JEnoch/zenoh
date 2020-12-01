@@ -25,9 +25,6 @@ use zenoh::{Timestamp, ZError, ZErrorKind, ZResult};
 use zenoh_util::collections::{Timed, TimedEvent, Timer};
 use zenoh_util::{zerror, zerror2};
 
-// Name of the RocksDB directory for the data-info database
-const DB_FILENAME: &str = ".zenoh_datainfo";
-
 // maximum size of serialized data-info: encoding (u64) + timestamp (u64 + ID at max size)
 const MAX_VAL_LEN: usize = 8 + 8 + uhlc::ID::MAX_SIZE;
 // minimum size of serialized data-info: encoding (u64) + timestamp (u64 + ID at 1 byte)
@@ -47,9 +44,12 @@ pub(crate) struct DataInfoMgr {
 }
 
 impl DataInfoMgr {
+    // Name of the RocksDB directory for the data-info database
+    pub(crate) const DB_FILENAME: &'static str = ".zenoh_datainfo";
+
     pub(crate) async fn new(base_dir: &Path) -> ZResult<Self> {
         let mut backup_file = PathBuf::from(base_dir);
-        backup_file.push(DB_FILENAME);
+        backup_file.push(DataInfoMgr::DB_FILENAME);
 
         let db = DB::open_default(&backup_file).map_err(|e| {
             zerror2!(ZErrorKind::Other {
