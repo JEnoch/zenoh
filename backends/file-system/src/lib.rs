@@ -14,17 +14,15 @@
 #![feature(async_closure)]
 
 use async_trait::async_trait;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use std::convert::TryFrom;
 use std::fs::DirBuilder;
 use std::io::prelude::*;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use tempfile::tempfile_in;
 use zenoh::net::{DataInfo, RBuf, Sample};
 use zenoh::{Change, ChangeKind, Properties, Selector, Value, ZError, ZErrorKind, ZResult};
 use zenoh_backend_traits::*;
-use zenoh_util::collections::{Timed, TimedEvent, TimedHandle, Timer};
 use zenoh_util::{zerror, zerror2};
 
 mod data_info_mgt;
@@ -39,9 +37,6 @@ pub const PROP_STORAGE_READ_ONLY: &str = "read_only";
 pub const PROP_STORAGE_DIR: &str = "dir";
 pub const PROP_STORAGE_ON_CLOSURE: &str = "on_closure";
 pub const PROP_STORAGE_FOLLOW_LINK: &str = "follow_links";
-
-// delay after deletion to drop a measurement
-const DROP_MEASUREMENT_TIMEOUT_MS: u64 = 5000;
 
 #[no_mangle]
 pub fn create_backend(properties: &Properties) -> ZResult<Box<dyn Backend>> {
@@ -169,7 +164,7 @@ impl Backend for FileSystemBackend {
                 })?;
         }
 
-        let files_mgr = FilesMgr::new(base_dir, follow_links, on_closure)?;
+        let files_mgr = FilesMgr::new(base_dir, follow_links, on_closure).await?;
 
         let admin_status = zenoh::utils::properties_to_json_value(&props);
         Ok(Box::new(FileSystemStorage {
@@ -177,7 +172,6 @@ impl Backend for FileSystemBackend {
             path_prefix,
             files_mgr,
             read_only,
-            timer: Timer::new(),
         }))
     }
 
@@ -195,20 +189,9 @@ struct FileSystemStorage {
     path_prefix: String,
     files_mgr: FilesMgr,
     read_only: bool,
-    timer: Timer,
 }
 
 impl FileSystemStorage {
-    async fn schedule_measurement_drop(&self, file: PathBuf) -> TimedHandle {
-        let event = TimedEvent::once(
-            Instant::now() + Duration::from_millis(DROP_MEASUREMENT_TIMEOUT_MS),
-            TimedFileCleanup { file },
-        );
-        let handle = event.get_handle();
-        self.timer.add(event).await;
-        handle
-    }
-
     async fn reply_with_matching_files(&self, query: &Query, path_expr: &str) {
         for zfile in self.files_mgr.matching_files(path_expr) {
             self.reply_with_file(query, &zfile).await;
@@ -221,8 +204,8 @@ impl FileSystemStorage {
             query.res_name(),
             zfile
         );
-        match self.files_mgr.read_file(&zfile) {
-            Ok((content, encoding, timestamp)) => {
+        match self.files_mgr.read_file(&zfile).await {
+            Ok(Some((content, encoding, timestamp))) => {
                 // append path_prefix to the zenoh path of this ZFile
                 let zpath = concat_str(&self.path_prefix, zfile.zpath.as_ref());
 
@@ -243,6 +226,7 @@ impl FileSystemStorage {
                     })
                     .await;
             }
+            Ok(None) => (), // file not found, do nothing
             Err(e) => warn!(
                 "Replying to query on {} : failed to read file {} : {}",
                 query.res_name(),
@@ -281,7 +265,7 @@ impl Storage for FileSystemStorage {
 
         // get latest timestamp for this file (if referenced in data-info db or if exists on disk)
         // and drop incoming sample if older
-        if let Some(old_ts) = self.files_mgr.get_timestamp(&zfile)? {
+        if let Some(old_ts) = self.files_mgr.get_timestamp(&zfile).await? {
             if change.timestamp < old_ts {
                 debug!("{} on {} dropped: out-of-date", change.kind, change.path);
                 return Ok(());
@@ -308,10 +292,7 @@ impl Storage for FileSystemStorage {
                     // write file
                     self.files_mgr
                         .write_file(&zfile, buf, encoding, change.timestamp)
-
-                    // Note: tags are stored as strings in InfluxDB, while fileds are typed.
-                    // For simpler/faster deserialization, we store encoding, timestamp and base64 as fields.
-                    // while the kind is stored as a tag to be indexed by InfluxDB and have faster queries on it.
+                        .await
                 } else {
                     warn!(
                         "Received PUT for read-only Files System Storage on {:?} - ignored",
@@ -322,17 +303,8 @@ impl Storage for FileSystemStorage {
             }
             ChangeKind::DELETE => {
                 if !self.read_only {
-                    // TODO
-                    error!("UNIMPL");
-
-                    // delete all points from the measurement that are older than this DELETE message
-                    // (in case more recent PUT have been recevived un-ordered)
-
-                    // store a point (with timestamp) with "delete" tag, thus we don't re-introduce an older point later
-
-                    // schedule the drop of measurement later in the future, if it's empty
-
-                    Ok(())
+                    // delete file
+                    self.files_mgr.delete_file(&zfile, change.timestamp).await
                 } else {
                     warn!(
                         "Received DELETE for read-only Files System Storage on {:?} - ignored",
@@ -342,7 +314,7 @@ impl Storage for FileSystemStorage {
                 }
             }
             ChangeKind::PATCH => {
-                println!("Received PATCH for {}: not yet supported", change.path);
+                warn!("Received PATCH for {}: not yet supported", change.path);
                 Ok(())
             }
         }
@@ -373,18 +345,6 @@ impl Storage for FileSystemStorage {
         }
 
         Ok(())
-    }
-}
-
-// Scheduled removal of file meta-data
-struct TimedFileCleanup {
-    file: PathBuf,
-}
-
-#[async_trait]
-impl Timed for TimedFileCleanup {
-    async fn run(&mut self) {
-        // TODO
     }
 }
 

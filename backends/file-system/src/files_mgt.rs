@@ -15,7 +15,7 @@
 use log::{debug, trace, warn};
 use std::borrow::Cow;
 use std::fmt;
-use std::fs::{metadata, DirBuilder, File};
+use std::fs::{metadata, remove_dir, remove_file, DirBuilder, File};
 use std::io::prelude::*;
 use std::iter::Iterator;
 use std::path::{Path, PathBuf};
@@ -54,12 +54,12 @@ pub(crate) struct FilesMgr {
 }
 
 impl FilesMgr {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         base_dir: PathBuf,
         follow_links: bool,
         on_closure: OnClosure,
     ) -> ZResult<Self> {
-        let data_info_mgr = DataInfoMgr::new(base_dir.as_path())?;
+        let data_info_mgr = DataInfoMgr::new(base_dir.as_path()).await?;
 
         let mut dir_builder = DirBuilder::new();
         dir_builder.recursive(true);
@@ -90,7 +90,7 @@ impl FilesMgr {
         PathBuf::from(os_str)
     }
 
-    pub(crate) fn write_file(
+    pub(crate) async fn write_file(
         &self,
         zfile: &ZFile<'_>,
         content: RBuf,
@@ -103,7 +103,7 @@ impl FilesMgr {
         if let Some(dir) = file.parent() {
             self.dir_builder.create(dir).map_err(|e| {
                 zerror2!(ZErrorKind::Other {
-                    descr: format!("Failed create directories for file {:?}: {}", file, e)
+                    descr: format!("Failed to create directories for file {:?}: {}", file, e)
                 })
             })?;
         }
@@ -112,19 +112,92 @@ impl FilesMgr {
         trace!("Write in file {:?}", file);
         let mut f = File::create(&file).map_err(|e| {
             zerror2!(ZErrorKind::Other {
-                descr: format!("Failed write in file {:?}: {}", file, e)
+                descr: format!("Failed to write in file {:?}: {}", file, e)
             })
         })?;
         for slice in content.get_slices() {
             f.write_all(slice.as_slice()).map_err(|e| {
                 zerror2!(ZErrorKind::Other {
-                    descr: format!("Failed write in file {:?}: {}", file, e)
+                    descr: format!("Failed to write in file {:?}: {}", file, e)
                 })
             })?;
         }
 
         // save data-info
-        self.data_info_mgr.put_data_info(file, encoding, timestamp)
+        self.data_info_mgr
+            .put_data_info(file, encoding, timestamp)
+            .await
+    }
+
+    pub(crate) async fn delete_file(&self, zfile: &ZFile<'_>, timestamp: Timestamp) -> ZResult<()> {
+        let file = &zfile.fspath;
+
+        // Delete file
+        trace!("Delete file {:?}", file);
+        if file.exists() {
+            remove_file(file).map_err(|e| {
+                zerror2!(ZErrorKind::Other {
+                    descr: format!("Failed to delete file {:?}: {}", file, e)
+                })
+            })?;
+        }
+
+        // try to delete parent directories if empty
+        let mut f = file.as_path();
+        while let Some(parent) = f.parent() {
+            if parent != self.base_dir() && remove_dir(parent).is_ok() {
+                trace!("Removed empty dir: {:?}", parent);
+            } else {
+                break;
+            }
+            f = parent;
+        }
+
+        // save timestamp in data-info (encoding is not used)
+        self.data_info_mgr.put_data_info(file, 0, timestamp).await
+    }
+
+    // Read a file and return it's content (as Vec<u8>), encoding and timestamp.
+    // Encoding and timestamp are retrieved from the data_info_mgr if file was put via zenoh.
+    // Otherwise, the encoding is guessed from the file extension, and the timestamp is computed from the file's time.
+    pub(crate) async fn read_file(
+        &self,
+        zfile: &ZFile<'_>,
+    ) -> ZResult<Option<(Vec<u8>, ZInt, Timestamp)>> {
+        let file = &zfile.fspath;
+        if file.exists() {
+            match File::open(&file) {
+                Ok(mut f) => {
+                    // TODO: what if file is too big ??
+                    let size = f.metadata().map(|m| m.len()).unwrap_or(256);
+                    if size <= usize::MAX as u64 {
+                        trace!("Read file {:?}", file);
+                        let mut content: Vec<u8> = Vec::with_capacity(size as usize);
+                        if let Err(e) = f.read_to_end(&mut content) {
+                            zerror!(ZErrorKind::Other {
+                                descr: format!(r#"Error reading file {:?}: {}"#, file, e)
+                            })
+                        } else {
+                            let (timestamp, encoding) =
+                                self.get_encoding_and_timestamp(zfile).await?;
+                            Ok(Some((content, timestamp, encoding)))
+                        }
+                    } else {
+                        zerror!(ZErrorKind::Other {
+                            descr: format!(
+                                r#"Error reading file {:?}: too big to fit in memory"#,
+                                file
+                            )
+                        })
+                    }
+                }
+                Err(e) => zerror!(ZErrorKind::Other {
+                    descr: format!(r#"Error reading file {:?}: {}"#, file, e)
+                }),
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     // Search for files matching path_expr.
@@ -151,45 +224,10 @@ impl FilesMgr {
         }
     }
 
-    // Read a file and return it's content (as Vec<u8>), encoding and timestamp.
-    // Encoding and timestamp are retrieved from the data_info_mgr if file was put via zenoh.
-    // Otherwise, the encoding is guessed from the file extension, and the timestamp is computed from the file's time.
-    pub(crate) fn read_file(&self, zfile: &ZFile<'_>) -> ZResult<(Vec<u8>, ZInt, Timestamp)> {
-        let file = &zfile.fspath;
-        match File::open(&file) {
-            Ok(mut f) => {
-                // TODO: what if file is too big ??
-                let size = f.metadata().map(|m| m.len()).unwrap_or(256);
-                if size <= usize::MAX as u64 {
-                    trace!("Read file {:?}", file);
-                    let mut content: Vec<u8> = Vec::with_capacity(size as usize);
-                    if let Err(e) = f.read_to_end(&mut content) {
-                        zerror!(ZErrorKind::Other {
-                            descr: format!(r#"Error reading file {:?}: {}"#, file, e)
-                        })
-                    } else {
-                        let (timestamp, encoding) = self.get_encoding_and_timestamp(zfile)?;
-                        Ok((content, timestamp, encoding))
-                    }
-                } else {
-                    zerror!(ZErrorKind::Other {
-                        descr: format!(
-                            r#"Error reading file {:?}: too big to fit in memory"#,
-                            file
-                        )
-                    })
-                }
-            }
-            Err(e) => zerror!(ZErrorKind::Other {
-                descr: format!(r#"Error reading file {:?}: {}"#, file, e)
-            }),
-        }
-    }
-
-    fn get_encoding_and_timestamp(&self, zfile: &ZFile<'_>) -> ZResult<(ZInt, Timestamp)> {
+    async fn get_encoding_and_timestamp(&self, zfile: &ZFile<'_>) -> ZResult<(ZInt, Timestamp)> {
         let file = &zfile.fspath;
         // try to get Encoding and Timestamp from data_info_mgr
-        match self.data_info_mgr.get_encoding_and_timestamp(file)? {
+        match self.data_info_mgr.get_encoding_and_timestamp(file).await? {
             Some(x) => Ok(x),
             None => {
                 trace!("data-info for {:?} not found; fallback to metadata", file);
@@ -207,10 +245,10 @@ impl FilesMgr {
         }
     }
 
-    pub(crate) fn get_timestamp(&self, zfile: &ZFile<'_>) -> ZResult<Option<Timestamp>> {
+    pub(crate) async fn get_timestamp(&self, zfile: &ZFile<'_>) -> ZResult<Option<Timestamp>> {
         let file = &zfile.fspath;
         // try to get Timestamp from data_info_mgr
-        match self.data_info_mgr.get_timestamp(&file)? {
+        match self.data_info_mgr.get_timestamp(&file).await? {
             Some(x) => Ok(Some(x)),
             None => {
                 // fallback: get timestamp from file's metadata if it exists
@@ -286,7 +324,7 @@ impl<'a> Iterator for FilesIterator<'a> {
                         if resource_name::intersect(zpath.as_ref(), zpath_expr) {
                             // matching file; return a ZFile
                             let zfile = ZFile {
-                                zpath: zpath,
+                                zpath,
                                 fspath: fspath.clone(),
                             };
                             return Some(zfile);
