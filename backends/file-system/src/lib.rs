@@ -84,7 +84,9 @@ impl Backend for FileSystemBackend {
         let read_only = props.contains_key(PROP_STORAGE_READ_ONLY);
         let follow_links = match props.get(PROP_STORAGE_FOLLOW_LINK) {
             Some(s) => {
-                if s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no") {
+                if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes") {
+                    true
+                } else if s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no") {
                     false
                 } else {
                     return zerror!(ZErrorKind::Other {
@@ -95,7 +97,7 @@ impl Backend for FileSystemBackend {
                     });
                 }
             }
-            None => true,
+            None => false,
         };
 
         let on_closure = match props.get(PROP_STORAGE_ON_CLOSURE) {

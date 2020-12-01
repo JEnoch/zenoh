@@ -12,7 +12,7 @@
 //   ADLINK zenoh team, <zenoh@adlink-labs.tech>
 //
 
-use log::{debug, trace, warn};
+use log::{debug, trace};
 use std::borrow::Cow;
 use std::fmt;
 use std::fs::{metadata, remove_dir, remove_file, DirBuilder, File};
@@ -165,7 +165,8 @@ impl FilesMgr {
         zfile: &ZFile<'_>,
     ) -> ZResult<Option<(Vec<u8>, ZInt, Timestamp)>> {
         let file = &zfile.fspath;
-        if file.exists() {
+        // consider file only is it exists, it's a file and in case of "follow_links=true" it doesn't contain symlink
+        if file.exists() && file.is_file() && (self.follow_links || !self.contains_symlink(file)) {
             match File::open(&file) {
                 Ok(mut f) => {
                     // TODO: what if file is too big ??
@@ -212,15 +213,29 @@ impl FilesMgr {
         let search_dir = self.to_fspath(segment);
         let base_dir_len = self.base_dir.as_os_str().len();
 
-        debug!(
-            "For path_expr={} search matching files in {:?}",
-            zpath_expr, search_dir
-        );
-        let walkdir = WalkDir::new(search_dir).follow_links(self.follow_links);
-        FilesIterator {
-            walk_iter: walkdir.into_iter(),
-            zpath_expr,
-            base_dir_len,
+        if !self.follow_links && self.contains_symlink(&search_dir) {
+            debug!(
+                "Don't search for files in {:?} as it's within a symbolic link",
+                search_dir
+            );
+            // return a useless FilesIterator that won't return anything (simpler than to return an Option<FilesIterator>)
+            let walkdir = WalkDir::new("");
+            FilesIterator {
+                walk_iter: walkdir.into_iter(),
+                zpath_expr,
+                base_dir_len,
+            }
+        } else {
+            debug!(
+                "For path_expr={} search matching files in {:?}",
+                zpath_expr, search_dir
+            );
+            let walkdir = WalkDir::new(search_dir).follow_links(self.follow_links);
+            FilesIterator {
+                walk_iter: walkdir.into_iter(),
+                zpath_expr,
+                base_dir_len,
+            }
         }
     }
 
@@ -282,6 +297,31 @@ impl FilesMgr {
             TimestampID::new(1, [0u8; TimestampID::MAX_SIZE]),
         ))
     }
+
+    // Check if a Path contains a segment which is a symbolic link
+    fn contains_symlink<P: AsRef<Path>>(&self, path: P) -> bool {
+        println!(
+            "*** CHECK SYMLINK for {:?} ({})",
+            path.as_ref(),
+            self.follow_links
+        );
+
+        if is_symlink(&path) {
+            return true;
+        }
+
+        let mut current = path.as_ref();
+        while let Some(parent) = current.parent() {
+            // check only up-to base_dir, and don't mind if it's itself a symbolic link
+            if parent == self.base_dir() {
+                return false;
+            } else if is_symlink(parent) {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
 }
 
 impl Drop for FilesMgr {
@@ -310,11 +350,64 @@ pub(crate) struct FilesIterator<'a> {
 impl<'a> Iterator for FilesIterator<'a> {
     type Item = ZFile<'a>;
     fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.walk_iter.next() {
+                Some(Ok(e)) => {
+                    if e.file_type().is_dir() {
+                        // skip content of DataInfoMgr::DB_FILENAME directory
+                        if e.file_name().to_str().unwrap_or_default() == DataInfoMgr::DB_FILENAME {
+                            self.walk_iter.skip_current_dir();
+                        }
+                        continue;
+                    } else {
+                        let fspath = e.into_path();
+                        if let Some(s) = fspath.to_str() {
+                            // zpath is the file's absolute path stripped from base_dir and converted as zenoh path
+                            // note: force owning to not have fspath borrowed
+                            let zpath =
+                                Cow::from(fspath_to_zpath(&s[self.base_dir_len..]).into_owned());
+                            // convert it to zenoh path for matching test with zpath_expr
+                            if resource_name::intersect(zpath.as_ref(), self.zpath_expr) {
+                                // matching file; return a ZFile
+                                let zfile = ZFile {
+                                    zpath,
+                                    fspath: fspath.clone(),
+                                };
+                                return Some(zfile);
+                            }
+                        } else {
+                            debug!(
+                                "Looking for files matching {}: ignore {:?} as non UTF-8 filename",
+                                self.zpath_expr, fspath
+                            );
+                        };
+                        continue;
+                    }
+                }
+                None => return None,
+                Some(Err(err)) => {
+                    // Cannot read file or dir... that might be normal (or not...) ignore it
+                    debug!(
+                        "Possible issue looking for files matching {} : {}",
+                        self.zpath_expr, err
+                    );
+                    continue;
+                }
+            };
+        }
+
+        /*
         let zpath_expr = self.zpath_expr;
         let base_dir_len = self.base_dir_len;
         self.walk_iter.find_map(|result| match result {
             Ok(e) => {
-                if e.file_type().is_file() {
+                if e.file_type().is_dir() {
+                    // skip content of DataInfoMgr::DB_FILENAME directory
+                    if e.file_name().to_str().unwrap_or_default() == DataInfoMgr::DB_FILENAME {
+                        self.walk_iter.skip_current_dir();
+                    }
+                    None
+                } else {
                     let fspath = e.into_path();
                     if let Some(s) = fspath.to_str() {
                         // zpath is the file's absolute path stripped from base_dir and converted as zenoh path
@@ -335,14 +428,14 @@ impl<'a> Iterator for FilesIterator<'a> {
                             zpath_expr, fspath
                         );
                     };
+                    None
                 }
-                None
             }
             Err(e) => {
                 warn!("Error looking for files matching {} : {}", zpath_expr, e);
                 None
             }
-        })
+        })*/
     }
 }
 
@@ -368,4 +461,11 @@ pub(crate) fn fspath_to_zpath(fspath: &str) -> Cow<'_, str> {
 pub(crate) fn fspath_to_zpath(fspath: &str) -> Cow<'_, str> {
     const ZENOH_SEP: &str = "/";
     Cow::from(fspath.replace(std::path::MAIN_SEPARATOR, ZENOH_SEP))
+}
+
+fn is_symlink<P: AsRef<Path>>(path: P) -> bool {
+    match path.as_ref().symlink_metadata() {
+        Ok(metadata) => metadata.file_type().is_symlink(),
+        Err(_) => false,
+    }
 }
