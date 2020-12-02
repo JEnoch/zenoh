@@ -300,12 +300,6 @@ impl FilesMgr {
 
     // Check if a Path contains a segment which is a symbolic link
     fn contains_symlink<P: AsRef<Path>>(&self, path: P) -> bool {
-        println!(
-            "*** CHECK SYMLINK for {:?} ({})",
-            path.as_ref(),
-            self.follow_links
-        );
-
         if is_symlink(&path) {
             return true;
         }
@@ -395,47 +389,6 @@ impl<'a> Iterator for FilesIterator<'a> {
                 }
             };
         }
-
-        /*
-        let zpath_expr = self.zpath_expr;
-        let base_dir_len = self.base_dir_len;
-        self.walk_iter.find_map(|result| match result {
-            Ok(e) => {
-                if e.file_type().is_dir() {
-                    // skip content of DataInfoMgr::DB_FILENAME directory
-                    if e.file_name().to_str().unwrap_or_default() == DataInfoMgr::DB_FILENAME {
-                        self.walk_iter.skip_current_dir();
-                    }
-                    None
-                } else {
-                    let fspath = e.into_path();
-                    if let Some(s) = fspath.to_str() {
-                        // zpath is the file's absolute path stripped from base_dir and converted as zenoh path
-                        // note: force owning to not have fspath borrowed
-                        let zpath = Cow::from(fspath_to_zpath(&s[base_dir_len..]).into_owned());
-                        // convert it to zenoh path for matching test with zpath_expr
-                        if resource_name::intersect(zpath.as_ref(), zpath_expr) {
-                            // matching file; return a ZFile
-                            let zfile = ZFile {
-                                zpath,
-                                fspath: fspath.clone(),
-                            };
-                            return Some(zfile);
-                        }
-                    } else {
-                        debug!(
-                            "Looking for files matching {}: ignore {:?} as non UTF-8 filename",
-                            zpath_expr, fspath
-                        );
-                    };
-                    None
-                }
-            }
-            Err(e) => {
-                warn!("Error looking for files matching {} : {}", zpath_expr, e);
-                None
-            }
-        })*/
     }
 }
 

@@ -23,11 +23,17 @@ use tempfile::tempfile_in;
 use zenoh::net::{DataInfo, RBuf, Sample};
 use zenoh::{Change, ChangeKind, Properties, Selector, Value, ZError, ZErrorKind, ZResult};
 use zenoh_backend_traits::*;
-use zenoh_util::{zerror, zerror2};
+use zenoh_util::{zenoh_home, zerror, zerror2};
 
 mod data_info_mgt;
 mod files_mgt;
 use files_mgt::*;
+
+/// The environement variable used to configure the root of all storages managed by this FileSystemBackend.
+pub const SCOPE_ENV_VAR: &str = "ZBACKEND_FS_ROOT";
+
+/// The default root (whithin zenoh's home directory) if the ZBACKEND_FS_ROOT environment variable is not specified.
+pub const DEFAULT_ROOT_DIR: &str = "zbackend_fs";
 
 // Properies used by the Backend
 //  - None
@@ -44,13 +50,26 @@ pub fn create_backend(properties: &Properties) -> ZResult<Box<dyn Backend>> {
     // Try to activate it here, ignoring failures.
     let _ = env_logger::try_init();
 
-    let admin_status = zenoh::utils::properties_to_json_value(properties);
+    let root = if let Some(dir) = std::env::var_os(SCOPE_ENV_VAR) {
+        PathBuf::from(dir)
+    } else {
+        let mut dir = PathBuf::from(zenoh_home());
+        dir.push(DEFAULT_ROOT_DIR);
+        dir
+    };
+    let mut props = properties.clone();
+    props.insert("root".into(), root.to_string_lossy().into());
 
-    Ok(Box::new(FileSystemBackend { admin_status }))
+    let admin_status = zenoh::utils::properties_to_json_value(&props);
+    Ok(Box::new(FileSystemBackend {
+        admin_status,
+        root: root.into(),
+    }))
 }
 
 pub struct FileSystemBackend {
     admin_status: Value,
+    root: PathBuf,
 }
 
 #[async_trait]
@@ -115,7 +134,16 @@ impl Backend for FileSystemBackend {
 
         let base_dir = props
             .get(PROP_STORAGE_DIR)
-            .map(PathBuf::from)
+            .map(|dir| {
+                // prepend base_dir with self.root
+                let mut base_dir = self.root.clone();
+                for segment in dir.split(std::path::MAIN_SEPARATOR) {
+                    if !segment.is_empty() {
+                        base_dir.push(segment);
+                    }
+                }
+                base_dir
+            })
             .ok_or_else(|| {
                 zerror2!(ZErrorKind::Other {
                     descr: format!(
