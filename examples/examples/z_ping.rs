@@ -64,7 +64,7 @@ fn main() {
         .collect::<Vec<u8>>()
         .into();
 
-    let mut samples = Vec::with_capacity(1000);
+    let mut samples = Vec::with_capacity(n);
 
     // -- warmup --
     println!("Warming up for {warmup:?}...");
@@ -76,6 +76,7 @@ fn main() {
         let _ = sub.recv();
     }
 
+    let mut start_time = Instant::now();
     for _ in 0..n {
         let data = data.clone();
         let write_time = Instant::now();
@@ -86,19 +87,21 @@ fn main() {
         let len = sample.unwrap().value.payload.len();
         samples.push((ts, len));
 
-        if samples.len() >= 1000 {
+        if start_time.elapsed() > one_sec {
             let count = samples.len();
             let rtt_sum: u128 = samples.iter().map(|(ts, _)| ts).sum();
             let rtt_mean = rtt_sum / count as u128;
             let len_sum: u128 = samples.iter().map(|(_, len)| *len as u128).sum();
             let len_mean = len_sum / count as u128;
             println!(
-                "{} bytes: rtt={:?}µs lat={:?}µs",
+                "{} ping/pong of {} bytes: rtt={:?}µs lat={:?}µs",
+                samples.len(),
                 len_mean,
                 rtt_mean,
                 rtt_mean / 2
             );
             samples.clear();
+            start_time = Instant::now();
         }
 
     }
