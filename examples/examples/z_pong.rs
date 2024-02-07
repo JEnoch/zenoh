@@ -1,5 +1,3 @@
-use std::io::{stdin, Read};
-
 //
 // Copyright (c) 2023 ZettaScale Technology
 //
@@ -13,6 +11,8 @@ use std::io::{stdin, Read};
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::thread::sleep;
+use std::time::Duration;
 use clap::Parser;
 use zenoh::config::Config;
 use zenoh::prelude::sync::*;
@@ -23,7 +23,8 @@ fn main() {
     // initiate logging
     env_logger::init();
 
-    let config = parse_args();
+    let args = Args::parse();
+    let config: Config = args.common.into();
 
     let session = zenoh::open(config).res().unwrap().into_arc();
 
@@ -44,16 +45,39 @@ fn main() {
         .callback(move |sample| publisher.put(sample.value).res().unwrap())
         .res()
         .unwrap();
-    for _ in stdin().bytes().take_while(|b| !matches!(b, Ok(b'q'))) {}
+
+    // The key expression to send parallel traffic
+    let key_expr_traffic = keyexpr::new("test/traffic").unwrap();
+
+    let traffic_publisher = session
+        .declare_publisher(key_expr_traffic)
+        .congestion_control(CongestionControl::Drop)
+        .res()
+        .unwrap();
+
+    let traffic_data: Value = (0..args.traffic_size)
+        .map(|i| (i % 10) as u8)
+        .collect::<Vec<u8>>()
+        .into();
+    let traffic_period = Duration::from_secs_f64(1_f64 / args.traffic_freq as f64);
+    println!("Publishing parallel traffic of {} bytes at {}ms interval => {:.2} Mb/s",
+        args.traffic_size,
+        traffic_period.as_millis(),
+        (args.traffic_size * 8 * args.traffic_freq) as f64 / 1000000_f64
+    );
+    loop {
+        traffic_publisher.put(traffic_data.clone()).res().unwrap();
+        sleep(traffic_period);
+    }
+
 }
 
 #[derive(clap::Parser, Clone, PartialEq, Eq, Hash, Debug)]
 struct Args {
     #[command(flatten)]
     common: CommonArgs,
-}
-
-fn parse_args() -> Config {
-    let args = Args::parse();
-    args.common.into()
+    #[arg(short = 's', long, default_value = "400000")]
+    traffic_size: usize,
+    #[arg(short = 'f', long, default_value = "30")]
+    traffic_freq: usize,
 }
