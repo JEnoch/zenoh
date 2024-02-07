@@ -51,7 +51,7 @@ fn main() {
         .callback(move |sample| {
             let mut start_time = start_time.write().unwrap();
             if start_time.elapsed() > one_sec {
-                println!("Received traffic: {:.2} Mb/s", recv_bytes.swap(0, std::sync::atomic::Ordering::Relaxed) * 8 / 1000000);
+                println!("Received traffic: {:.2} Mb/s", recv_bytes.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 * 8_f64 / 1000000_f64);
                 *start_time = Instant::now();
             }
             recv_bytes.fetch_add(sample.value.payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -87,6 +87,7 @@ fn main() {
         let len = sample.unwrap().value.payload.len();
         samples.push((ts, len));
 
+        // println!("... {} s", start_time.elapsed().as_secs_f32());
         if start_time.elapsed() > one_sec {
             let count = samples.len();
             let rtt_sum: u128 = samples.iter().map(|(ts, _)| ts).sum();
