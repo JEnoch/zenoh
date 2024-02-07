@@ -64,7 +64,7 @@ fn main() {
         .collect::<Vec<u8>>()
         .into();
 
-    let mut samples = Vec::with_capacity(n);
+    let mut samples = Vec::with_capacity(1000);
 
     // -- warmup --
     println!("Warming up for {warmup:?}...");
@@ -85,22 +85,24 @@ fn main() {
         let ts = write_time.elapsed().as_micros();
         let len = sample.unwrap().value.payload.len();
         samples.push((ts, len));
+
+        if samples.len() >= 1000 {
+            let count = samples.len();
+            let rtt_sum: u128 = samples.iter().map(|(ts, _)| ts).sum();
+            let rtt_mean = rtt_sum / count as u128;
+            let len_sum: u128 = samples.iter().map(|(_, len)| *len as u128).sum();
+            let len_mean = len_sum / count as u128;
+            println!(
+                "{} bytes: rtt={:?}µs lat={:?}µs",
+                len_mean,
+                rtt_mean,
+                rtt_mean / 2
+            );
+            samples.clear();
+        }
+
     }
 
-    let count = samples.len();
-    let rtt_sum: u128 = samples.iter().map(|(ts, _)| ts).sum();
-    let rtt_mean = rtt_sum / count as u128;
-
-
-    let len_sum: u128 = samples.iter().map(|(_, len)| *len as u128).sum();
-    let len_mean = len_sum / count as u128;
-
-    println!(
-        "{} bytes: rtt={:?}µs lat={:?}µs",
-        len_mean,
-        rtt_mean,
-        rtt_mean / 2
-    );
 
 }
 
