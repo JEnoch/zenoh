@@ -11,6 +11,7 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::io::{stdin, Read};
 use std::thread::sleep;
 use std::time::Duration;
 use clap::Parser;
@@ -46,28 +47,32 @@ fn main() {
         .res()
         .unwrap();
 
-    // The key expression to send parallel traffic
-    let key_expr_traffic = keyexpr::new("test/traffic").unwrap();
+    if args.traffic_size > 0 {
+        // The key expression to send parallel traffic
+        let key_expr_traffic = keyexpr::new("test/traffic").unwrap();
 
-    let traffic_publisher = session
-        .declare_publisher(key_expr_traffic)
-        .congestion_control(CongestionControl::Drop)
-        .res()
-        .unwrap();
+        let traffic_publisher = session
+            .declare_publisher(key_expr_traffic)
+            .congestion_control(CongestionControl::Drop)
+            .res()
+            .unwrap();
 
-    let traffic_data: Value = (0..args.traffic_size)
-        .map(|i| (i % 10) as u8)
-        .collect::<Vec<u8>>()
-        .into();
-    let traffic_period = Duration::from_secs_f64(1_f64 / args.traffic_freq as f64);
-    println!("Publishing parallel traffic of {} bytes at {}ms interval => {:.2} Mb/s",
-        args.traffic_size,
-        traffic_period.as_millis(),
-        (args.traffic_size * 8 * args.traffic_freq) as f64 / 1000000_f64
-    );
-    loop {
-        traffic_publisher.put(traffic_data.clone()).res().unwrap();
-        sleep(traffic_period);
+        let traffic_data: Value = (0..args.traffic_size)
+            .map(|i| (i % 10) as u8)
+            .collect::<Vec<u8>>()
+            .into();
+        let traffic_period = Duration::from_secs_f64(1_f64 / args.traffic_freq as f64);
+        println!("Publishing parallel traffic of {} bytes at {}ms interval => {:.2} Mb/s",
+            args.traffic_size,
+            traffic_period.as_millis(),
+            (args.traffic_size * 8 * args.traffic_freq) as f64 / 1000000_f64
+        );
+        loop {
+            traffic_publisher.put(traffic_data.clone()).res().unwrap();
+            sleep(traffic_period);
+        }
+    } else {
+        for _ in stdin().bytes().take_while(|b| !matches!(b, Ok(b'q'))) {}
     }
 
 }
